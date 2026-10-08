@@ -16,13 +16,6 @@ use crate::aggregation::value_source::ValueSourceDictionary;
 ///
 /// All of the terms are concatenated in a single buffer. A separate offset index gives the
 /// boundaries of each term.
-///
-/// The hash table stores the term ord and a 32-bit hash of the term. This way, the table never
-/// reads the terms when it grows, and most of the comparisons with a different term stop at the
-/// hash. Equality always compares the term bytes: a hash collision costs an extra comparison, and
-/// never merges two terms.
-///
-/// Contract: at most `u32::MAX` terms. `intern` panics beyond that.
 pub(crate) struct DynamicTermDictionary {
     /// Concatenation of all of the terms, in term ord order.
     buffer: Vec<u8>,
@@ -34,7 +27,9 @@ pub(crate) struct DynamicTermDictionary {
     term_ords: HashTable<TermOrdItem>,
 }
 
-/// An item of the hash table: a term ord and the 32-bit hash of its term.
+/// An item of the hash table
+///
+/// We store the 32 bits term to avoid recomputing it upon table resize.
 #[derive(Clone, Copy)]
 struct TermOrdItem {
     ord: u32,

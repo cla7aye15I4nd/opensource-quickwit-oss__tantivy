@@ -1,16 +1,14 @@
 //! The value sources of a jitexpr expression on a segment.
 
-use columnar::{
-    Cardinality, Column, ColumnType, DynamicColumn, DynamicColumnHandle,
-    MonotonicallyMappableToU64, RowId, StrColumn,
-};
+use columnar::{Cardinality, ColumnType, MonotonicallyMappableToU64, RowId};
+use common::VersatileBuffer;
 use jitexpr::compile::CompiledFnCtx;
 use jitexpr::types::{VarType, VariableValue};
 
 use super::dynamic_term_dictionary::DynamicTermDictionary;
+use super::input_column::InputColumn;
 use crate::aggregation::value_source::{ValueSource, ValueSourceDictionary};
-use crate::query::doc_predicate_query::var_type_for_column_type;
-use crate::{DocId, TantivyError, COLLECT_BLOCK_BUFFER_LEN};
+use crate::DocId;
 
 /// The value source of a jitexpr expression on a segment.
 ///
@@ -31,6 +29,9 @@ pub(super) struct JitExprValueSource {
     inputs: Vec<InputColumn>,
     /// Interns the `Str` results.
     term_dictionary: DynamicTermDictionary,
+    /// Reusable allocation for the arguments of `compiled_fn`, lent as a `Vec<VariableValue>` for
+    /// each block.
+    args: VersatileBuffer<VariableValue<'static>>,
 }
 
 impl JitExprValueSource {
@@ -45,13 +46,15 @@ impl JitExprValueSource {
         // Evaluating the function with inputs of the wrong type is undefined behavior.
         assert_eq!(compiled_fn.inputs().len(), inputs.len());
         for (compiled_input, input) in compiled_fn.inputs().iter().zip(&inputs) {
-            assert_eq!(compiled_input.r#type, input.var_type);
+            assert_eq!(compiled_input.r#type, input.var_type());
         }
+        let num_inputs = inputs.len();
         JitExprValueSource {
             compiled_fn,
             column_type,
             inputs,
             term_dictionary: DynamicTermDictionary::default(),
+            args: VersatileBuffer::with_capacity(num_inputs),
         }
     }
 }
@@ -87,10 +90,12 @@ impl ValueSource for JitExprValueSource {
             compiled_fn,
             inputs,
             term_dictionary,
+            args,
             ..
         } = self;
         let result_type: VarType = compiled_fn.result_type();
-        let mut args: Vec<VariableValue> = Vec::with_capacity(inputs.len());
+        // The allocation goes back to the source when `args` is dropped, at the end of the block.
+        let mut args = args.borrow::<VariableValue>();
         for (doc_pos, &doc) in docs.iter().enumerate() {
             args.clear();
             for input in inputs.iter() {
@@ -100,18 +105,17 @@ impl ValueSource for JitExprValueSource {
             // are borrowed from `inputs`, which are not modified during the call.
             let result: VariableValue = unsafe { compiled_fn.call(&args) };
             // SAFETY: `result` has the result type of the compiled function.
-            let Some(value) = (unsafe { encode_result(result, result_type, term_dictionary) })
-            else {
-                continue;
-            };
-            values.push(value);
-            docids.push(doc);
+            if let Some(value) = unsafe { encode_result(result, result_type, term_dictionary) } {
+                values.push(value);
+                docids.push(doc);
+            }
         }
         if values.len() == docs.len() {
             // Each doc has exactly one value, in the order of `docs`.
-            return Cardinality::Full;
+            Cardinality::Full
+        } else {
+            Cardinality::Optional
         }
-        Cardinality::Optional
     }
 
     fn term_dictionary(&self) -> Option<&dyn ValueSourceDictionary> {
@@ -204,134 +208,6 @@ unsafe fn encode_result(
                 .map(|term: &str| term_dictionary.intern(term.as_bytes())),
             VarType::None => None,
         }
-    }
-}
-
-/// A fast-field column bound to an input of the compiled expression.
-pub(super) struct InputColumn {
-    var_type: VarType,
-    /// Values in their monotonic `u64` mapping. Term ords for a `Str` input.
-    column: Column<u64>,
-    /// The dictionary of the term ords. `Some` if and only if `var_type` is `Str`.
-    str_column: Option<StrColumn>,
-    /// `first_values[i]` is the first value of `docs[i]`, for the docs of the last block.
-    first_values: Vec<Option<u64>>,
-    /// The terms of `first_values`, for a `Str` input.
-    block_terms: BlockTerms,
-}
-
-impl InputColumn {
-    /// Opens the column of `handle`, for an input of type `var_type`.
-    pub(super) fn open(
-        handle: &DynamicColumnHandle,
-        var_type: VarType,
-    ) -> crate::Result<InputColumn> {
-        let column_type = handle.column_type();
-        if var_type_for_column_type(column_type) != Some(var_type) {
-            return Err(TantivyError::InternalError(format!(
-                "an input of type {var_type:?} cannot be bound to a column of type {column_type}"
-            )));
-        }
-        let (column, str_column) = if var_type == VarType::Str {
-            let DynamicColumn::Str(str_column) = handle.open()? else {
-                return Err(TantivyError::InternalError(
-                    "a text column could not be opened as a text column".to_string(),
-                ));
-            };
-            (str_column.ords().clone(), Some(str_column))
-        } else {
-            let Some(column) = handle.open_u64_lenient()? else {
-                return Err(TantivyError::InternalError(format!(
-                    "a column of type {column_type} could not be opened as u64"
-                )));
-            };
-            (column, None)
-        };
-        Ok(InputColumn {
-            var_type,
-            column,
-            str_column,
-            first_values: Vec::with_capacity(COLLECT_BLOCK_BUFFER_LEN),
-            block_terms: BlockTerms::default(),
-        })
-    }
-
-    /// Loads the first value of each doc of `docs`.
-    ///
-    /// Panics if the dictionary of a text column is corrupted.
-    fn load_block(&mut self, docs: &[DocId]) {
-        // `first_vals` does not write the entries of the docs without a value: we reset them.
-        self.first_values.clear();
-        self.first_values.resize(docs.len(), None);
-        self.column.first_vals(docs, &mut self.first_values);
-        if let Some(str_column) = &self.str_column {
-            self.block_terms.load(str_column, &self.first_values);
-        }
-    }
-
-    /// Returns the value of `docs[doc_pos]`, for the `docs` of the last `load_block` call.
-    #[inline]
-    fn value(&self, doc_pos: usize) -> VariableValue<'_> {
-        let Some(value) = self.first_values[doc_pos] else {
-            return VariableValue::none();
-        };
-        match self.var_type {
-            VarType::Bool => VariableValue::from(bool::from_u64(value)),
-            VarType::I64 => VariableValue::from(i64::from_u64(value)),
-            VarType::U64 => VariableValue::from(value),
-            VarType::F64 => VariableValue::from(f64::from_u64(value)),
-            VarType::Str => VariableValue::from(self.block_terms.term(value)),
-            VarType::None => VariableValue::none(),
-        }
-    }
-}
-
-/// The terms of the term ords of a block, fetched with a single dictionary lookup.
-#[derive(Default)]
-struct BlockTerms {
-    /// The distinct term ords of the block, sorted.
-    sorted_ords: Vec<u64>,
-    /// The concatenated terms, in the order of `sorted_ords`.
-    buffer: String,
-    /// `buffer[offsets[i]..offsets[i + 1]]` is the term of `sorted_ords[i]`.
-    offsets: Vec<usize>,
-}
-
-impl BlockTerms {
-    /// Panics if the dictionary is corrupted: `load_block` cannot return an error.
-    fn load(&mut self, str_column: &StrColumn, term_ords: &[Option<u64>]) {
-        let BlockTerms {
-            sorted_ords,
-            buffer,
-            offsets,
-        } = self;
-        sorted_ords.clear();
-        sorted_ords.extend(term_ords.iter().flatten());
-        sorted_ords.sort_unstable();
-        sorted_ords.dedup();
-        buffer.clear();
-        offsets.clear();
-        offsets.push(0);
-        let all_found = str_column
-            .dictionary()
-            .sorted_ords_to_term_cb(sorted_ords, |term| {
-                let term_str =
-                    std::str::from_utf8(term).expect("fast-field string dictionary is corrupted");
-                buffer.push_str(term_str);
-                offsets.push(buffer.len());
-            })
-            .expect("fast-field string dictionary is corrupted");
-        assert!(all_found, "fast-field string dictionary is corrupted");
-    }
-
-    /// Precondition: `term_ord` is one of the term ords of the last `load` call.
-    #[inline]
-    fn term(&self, term_ord: u64) -> &str {
-        let idx = self
-            .sorted_ords
-            .binary_search(&term_ord)
-            .expect("the term ord belongs to the block");
-        &self.buffer[self.offsets[idx]..self.offsets[idx + 1]]
     }
 }
 

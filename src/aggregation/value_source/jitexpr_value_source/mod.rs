@@ -1,7 +1,8 @@
 //! A [`ValueSource`] computing its values with a jitexpr expression.
 
 mod dynamic_term_dictionary;
-mod segment_source;
+mod input_column;
+mod jitexpr_value_source;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,8 @@ use jitexpr::ast::{infer_types, infer_types_with_target, InferredTypeSet, TypeEr
 use jitexpr::compile::CompiledFn;
 use jitexpr::types::VarType;
 
-use self::segment_source::{ConstantValueSource, InputColumn, JitExprValueSource};
+use self::input_column::InputColumn;
+use self::jitexpr_value_source::{ConstantValueSource, JitExprValueSource};
 use super::{ValueSource, ValueSourceProvider};
 use crate::query::doc_predicate_query::{find_input_column_handle, var_type_for_column_type};
 use crate::{SegmentReader, TantivyError};
@@ -19,19 +21,16 @@ use crate::{SegmentReader, TantivyError};
 /// A [`ValueSourceProvider`] computing values with a jitexpr expression over the fast fields of a
 /// segment.
 ///
-/// Requires the `jitexpr` feature. Variable names are resolved as fast-field names.
-///
 /// # Types
 ///
-/// The expression is untyped. Its types are resolved for each segment, from the column types of
+/// The expr types are resolved for each segment, from the column types of
 /// the segment and the column types accepted by the aggregation. The result type can therefore
 /// differ from one segment to another: e.g. `(ADD a 1i64)` is `i64` on a segment where `a` is an
 /// `i64` column, and `f64` on a segment where `a` is an `f64` column.
 ///
-/// - A variable is bound to the first column of its name with a type it accepts. A variable without
-///   such a column is null.
-/// - If the expression can never produce a type accepted by the aggregation, `for_segment` returns
-///   an error. jitexpr has no date type: date aggregations always fail.
+/// - If the expression can never produce a type accepted by the aggregation (regardless of what
+///   columns are present).
+///  e.g. jitexpr has no date type: date aggregations always fail.
 /// - If the expression does not produce an accepted type on a given segment, the source has no
 ///   value on that segment.
 ///
@@ -153,7 +152,16 @@ impl ValueSourceProvider for JitExprValueSourceProvider {
                     compiled_input.variable_name
                 )));
             };
-            inputs.push(InputColumn::open(&handle, compiled_input.r#type)?);
+            let input = InputColumn::open(&handle)?;
+            if input.var_type() != compiled_input.r#type {
+                return Err(TantivyError::InternalError(format!(
+                    "the compiled input `{}` expects {:?}, but its column has type {}",
+                    compiled_input.variable_name,
+                    compiled_input.r#type,
+                    handle.column_type()
+                )));
+            }
+            inputs.push(input);
         }
         Ok(Box::new(JitExprValueSource::new(
             compiled_fn.context(),
