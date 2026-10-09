@@ -69,8 +69,8 @@ pub trait ValueSource: std::fmt::Debug {
 
     /// Dictionary resolving the term ords returned by `load_block`, for `Str` sources.
     ///
-    /// Every `Str` source with values must return its dictionary. `None` is only acceptable for
-    /// a source without any value (e.g. the empty-column shim of an absent field).
+    /// Contract: every `Str` source must return `Some`, even if it has no values (it then returns
+    /// an empty dictionary). Non-`Str` sources return `None`.
     ///
     /// Contract: the ords returned by earlier `load_block` calls remain valid. The dictionary
     /// may grow as more blocks are loaded.

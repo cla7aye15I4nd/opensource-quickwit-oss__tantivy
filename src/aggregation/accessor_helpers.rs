@@ -2,7 +2,7 @@
 
 use std::io;
 
-use columnar::{Column, ColumnType, DynamicColumn, DynamicColumnHandle};
+use columnar::{BytesColumn, Column, ColumnType, DynamicColumn, DynamicColumnHandle, StrColumn};
 
 use crate::aggregation::value_source::ValueSource;
 use crate::aggregation::{f64_to_fastfield_u64, Key, ValueSourceRegistry};
@@ -136,12 +136,21 @@ pub(crate) fn get_all_value_sources(
     let mut sources: Vec<Box<dyn ValueSource>> =
         open_column_value_sources(reader, field_name, allowed_column_types, false)?;
     if sources.is_empty() {
-        sources.push(Box::new((
-            Column::build_empty_column(reader.num_docs()),
-            fallback_type,
-        )));
+        sources.push(build_empty_value_source(reader.num_docs(), fallback_type));
     }
     Ok(sources)
+}
+
+/// Builds the value source of a field without any column, with the given type.
+///
+/// A `Str` shim is an empty `StrColumn`, so that it has an (empty) term dictionary, as required by
+/// `ValueSource::term_dictionary`.
+fn build_empty_value_source(num_docs: u32, column_type: ColumnType) -> Box<dyn ValueSource> {
+    if column_type == ColumnType::Str {
+        Box::new(StrColumn::wrap(BytesColumn::empty(num_docs)))
+    } else {
+        Box::new((Column::build_empty_column(num_docs), column_type))
+    }
 }
 
 /// Opens the fast-field columns of `field_name` whose type is allowed, in columnar order.
